@@ -23,28 +23,208 @@ use std::sync::{OnceLock, RwLock};
 // Security Constants
 // ============================================================================
 
-/// Hardcoded public keys for verifying provider signatures (Ed25519, Base64)
-/// Each provider can have its own trusted public key.
+/// Hardcoded built-in public keys for verifying provider signatures (Ed25519, Base64).
 ///
-/// To add a new provider:
-/// 1. Generate Ed25519 key pair using: python scripts/generate_signing_keys.py
-/// 2. Add the public key (base64) here with the provider name
-/// 3. Store the private key as a GitHub Secret (ED25519_SIGNING_KEY) in the provider's repo
-///
-/// The signature verification uses Ed25519 algorithm:
+/// Built-in entries are always trusted and cannot be overridden by runtime extensions
+/// (see `resolve_provider_pubkey` below). The signature verification uses Ed25519:
 /// - Library file (.so/.dylib/.pyd) is signed with the private key
 /// - Signature is stored in <library_file>.sig (base64 encoded)
-/// - This public key is used to verify the signature before loading the library
-const PROVIDER_PUBLIC_KEYS: &[(&str, &str)] = &[
+/// - The public key here verifies that signature before `libloading::Library::new` runs
+const PROVIDER_PUBLIC_KEYS_BUILTIN: &[(&str, &str)] = &[
     // KoalaVault vLLM Client provider
-    // Ed25519 public key for verifying library signatures
     (
         "koalavault-vllm",
         "vM5cRuHaIyKt3RAELcqc4+nXbSbCh53ABYt2/lOGqw8=",
     ),
-    // Add more providers and their public keys here
-    // ("aws-kms", "..."),
+    // Add more built-in providers here.
 ];
+
+// ============================================================================
+// Extensible Provider Public Key Whitelist  (fork-only feature, v0.2.3-ext)
+// ============================================================================
+//
+// In addition to the hardcoded built-in whitelist above, this fork allows
+// private deployments to register additional trusted provider public keys
+// via two opt-in external sources:
+//
+//   1. CRYPTOTENSOR_TRUSTED_PROVIDERS_FILE   — JSON file, recommended for
+//      production. Must not be world-writable (enforced on Unix).
+//      Format:
+//        { "providers": [ { "name": "...", "pubkey": "<base64>", "note": "..." } ] }
+//
+//   2. CRYPTOTENSOR_TRUSTED_PROVIDER_PUBKEYS — comma-separated inline env var,
+//      for container debugging / temporary overrides:
+//        "name1=base64pubkey1,name2=base64pubkey2"
+//
+// Rules:
+//   - Built-in entries always win; an extension entry with a built-in name is
+//     silently shadowed (not an error — keeps built-in guarantees intact).
+//   - If the same name appears in both the file and the env var with
+//     DIFFERENT pubkeys, resolution fails loudly (no silent precedence).
+//   - Every successful extension match emits a stderr WARNING with a short
+//     sha256 fingerprint of the pubkey, for audit.
+//
+// This feature is OFF by default: neither env var being set means behavior is
+// byte-for-byte identical to upstream v0.2.3.
+
+#[derive(serde::Deserialize)]
+struct TrustedProvidersFile {
+    providers: Vec<TrustedProviderEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct TrustedProviderEntry {
+    name: String,
+    pubkey: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    note: Option<String>,
+}
+
+/// Validate that `pubkey_b64` decodes to a 32-byte Ed25519 public key.
+fn validate_ed25519_pubkey_b64(pubkey_b64: &str) -> Result<(), CryptoTensorsError> {
+    let bytes = BASE64.decode(pubkey_b64).map_err(|e| {
+        CryptoTensorsError::Registry(format!("Invalid base64 provider pubkey: {}", e))
+    })?;
+    if bytes.len() != 32 {
+        return Err(CryptoTensorsError::Registry(format!(
+            "Ed25519 pubkey must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Short sha256 fingerprint of a base64 pubkey (first 8 bytes hex) for audit logs.
+fn pubkey_audit_fingerprint(pubkey_b64: &str) -> String {
+    use ring::digest;
+    let hash = digest::digest(&digest::SHA256, pubkey_b64.as_bytes());
+    hash.as_ref()
+        .iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Reject world-writable config files on Unix; a no-op on other platforms.
+fn check_config_file_permissions(path: &str) -> Result<(), CryptoTensorsError> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        CryptoTensorsError::Registry(format!(
+            "Cannot stat trusted providers file {}: {}",
+            path, e
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o002 != 0 {
+            return Err(CryptoTensorsError::Registry(format!(
+                "Trusted providers file {} is world-writable (mode={:o}); refusing to load",
+                path,
+                mode & 0o777
+            )));
+        }
+    }
+    let _ = metadata; // silence unused on non-Unix
+    Ok(())
+}
+
+/// Load the merged map of extension pubkeys from env + config file.
+///
+/// Deliberately not cached: `verify_library_signature` is on the cold path
+/// (called once per `load_provider_native`), and always re-reading keeps the
+/// behavior transparent for tests and hot config reloads.
+fn load_trusted_provider_extras() -> Result<HashMap<String, String>, CryptoTensorsError> {
+    let mut result: HashMap<String, String> = HashMap::new();
+    let mut source_of: HashMap<String, &'static str> = HashMap::new();
+
+    // 1. Config file
+    if let Ok(path) = std::env::var("CRYPTOTENSOR_TRUSTED_PROVIDERS_FILE") {
+        if !path.is_empty() {
+            check_config_file_permissions(&path)?;
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                CryptoTensorsError::Registry(format!(
+                    "Failed to read trusted providers file {}: {}",
+                    path, e
+                ))
+            })?;
+            let parsed: TrustedProvidersFile = serde_json::from_str(&content).map_err(|e| {
+                CryptoTensorsError::Registry(format!(
+                    "Invalid trusted providers file {}: {}",
+                    path, e
+                ))
+            })?;
+            for p in parsed.providers {
+                validate_ed25519_pubkey_b64(&p.pubkey)?;
+                result.insert(p.name.clone(), p.pubkey);
+                source_of.insert(p.name, "file");
+            }
+        }
+    }
+
+    // 2. Env var
+    if let Ok(raw) = std::env::var("CRYPTOTENSOR_TRUSTED_PROVIDER_PUBKEYS") {
+        for entry in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let (name, pubkey) = entry.split_once('=').ok_or_else(|| {
+                CryptoTensorsError::Registry(format!(
+                    "Invalid CRYPTOTENSOR_TRUSTED_PROVIDER_PUBKEYS entry (expected name=pubkey): {}",
+                    entry
+                ))
+            })?;
+            let name = name.trim().to_string();
+            let pubkey = pubkey.trim().to_string();
+            validate_ed25519_pubkey_b64(&pubkey)?;
+
+            if let Some(existing) = result.get(&name) {
+                if existing != &pubkey {
+                    let prev_src = source_of.get(&name).copied().unwrap_or("file");
+                    return Err(CryptoTensorsError::Registry(format!(
+                        "Conflicting pubkeys for provider '{}' between {} and env var; refusing to resolve",
+                        name, prev_src
+                    )));
+                }
+            }
+            result.insert(name.clone(), pubkey);
+            source_of.entry(name).or_insert("env");
+        }
+    }
+
+    Ok(result)
+}
+
+/// Resolve the trusted Ed25519 pubkey for a provider name.
+///
+/// Order:
+///   1. Built-in whitelist (always wins)
+///   2. Runtime extensions (config file + env var)
+///
+/// Returns `Ok(None)` when no match is found (the caller produces the usual
+/// "No trusted public key configured" error). Returns `Err` only when the
+/// extension config itself is malformed (invalid base64, permission check
+/// failure, same-name conflict, etc.) — failing loudly is preferable to
+/// silently falling back to "no match" in those cases.
+pub fn resolve_provider_pubkey(name: &str) -> Result<Option<String>, CryptoTensorsError> {
+    if let Some((_, k)) = PROVIDER_PUBLIC_KEYS_BUILTIN
+        .iter()
+        .find(|(n, _)| *n == name)
+    {
+        return Ok(Some(k.to_string()));
+    }
+
+    let extras = load_trusted_provider_extras()?;
+    if let Some(pubkey) = extras.get(name) {
+        eprintln!(
+            "WARNING: cryptotensors: trusting extension provider pubkey: name={} fingerprint=sha256:{}",
+            name,
+            pubkey_audit_fingerprint(pubkey)
+        );
+        return Ok(Some(pubkey.clone()));
+    }
+    Ok(None)
+}
 
 // ============================================================================
 // Priority Constants
@@ -857,17 +1037,13 @@ pub type CreateProviderFn = unsafe extern "C" fn() -> *mut dyn KeyProvider;
 fn verify_library_signature(provider_name: &str, lib_path: &str) -> Result<(), CryptoTensorsError> {
     let sig_path = format!("{}.sig", lib_path);
 
-    // Find the public key for this provider
-    let public_key_str = PROVIDER_PUBLIC_KEYS
-        .iter()
-        .find(|(name, _)| *name == provider_name)
-        .map(|(_, key)| *key)
-        .ok_or_else(|| {
-            CryptoTensorsError::Registry(format!(
-                "No trusted public key configured for provider: {}",
-                provider_name
-            ))
-        })?;
+    // Find the public key for this provider (built-in whitelist + runtime extensions)
+    let public_key_str = resolve_provider_pubkey(provider_name)?.ok_or_else(|| {
+        CryptoTensorsError::Registry(format!(
+            "No trusted public key configured for provider: {}",
+            provider_name
+        ))
+    })?;
 
     // Read library file
     let mut lib_file = File::open(lib_path)
