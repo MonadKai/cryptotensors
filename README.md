@@ -1,4 +1,94 @@
 
+> **Fork notice (ResultsCloud private build).**
+> This repository is a private fork of
+> [aiyah-meloken/cryptotensors](https://github.com/aiyah-meloken/cryptotensors),
+> branched from tag `v0.2.3`. It adds exactly one feature on top of
+> upstream — a **runtime-extensible provider public-key whitelist** —
+> so third-party native providers (specifically
+> `cryptotensors-provider-resultscloud-license`) can be trusted without
+> editing the hardcoded `PROVIDER_PUBLIC_KEYS_BUILTIN` const in
+> `registry.rs`. See [CHANGELOG.md](CHANGELOG.md) for the exact diff.
+>
+> The fork's first release is tagged **`v0.2.3-ext`** on branch
+> `feature/extensible-provider-pubkeys`. It is not published to PyPI —
+> build the wheel from source or consume it via a private index.
+>
+> All upstream behavior is preserved byte-for-byte when neither
+> `CRYPTOTENSOR_TRUSTED_PROVIDERS_FILE` nor
+> `CRYPTOTENSOR_TRUSTED_PROVIDER_PUBKEYS` is set; see the **Extensible
+> provider whitelist** section below for the opt-in runtime
+> configuration.
+
+---
+
+## Extensible provider whitelist (`v0.2.3-ext`)
+
+`cryptotensors::registry::verify_library_signature` used to look up
+trusted pubkeys only in a compile-time `const` slice, which meant any
+new signed native provider required a source edit. This fork adds a
+two-source runtime extension path. Both are **opt-in** — the absence of
+both variables is byte-for-byte identical to upstream `v0.2.3`.
+
+**1. Config file** (recommended, production): point
+`CRYPTOTENSOR_TRUSTED_PROVIDERS_FILE` at a JSON file. Unix hosts refuse
+to load it if it is world-writable.
+
+```json
+{
+  "providers": [
+    { "name": "resultscloud-license", "pubkey": "<standard-base64 Ed25519 pub>", "note": "optional" }
+  ]
+}
+```
+
+**2. Env var** (container / ad-hoc debug): comma-separated
+`name=pubkey` pairs. Same pubkey as above.
+
+```bash
+export CRYPTOTENSOR_TRUSTED_PROVIDER_PUBKEYS="resultscloud-license=<base64>,other-provider=<base64>"
+```
+
+Rules enforced by `resolve_provider_pubkey`:
+
+- Built-in entries (e.g. `koalavault-vllm`) always win; extensions
+  cannot override them.
+- Same `name` in both sources with **different** pubkeys → resolution
+  fails loudly (no silent precedence).
+- Every extension match writes a stderr WARNING carrying the name and a
+  short sha256 fingerprint of the pubkey, for audit.
+
+The integration suite lives at
+[`safetensors/tests/ext_provider_keys_test.rs`](safetensors/tests/ext_provider_keys_test.rs)
+(7 cases: no-config parity, file load, invalid pubkey, env-var load,
+file↔env conflict, world-writable rejection, built-in shadowing).
+
+## Building a wheel from this fork
+
+Upstream's build instructions apply verbatim. A typical invocation is:
+
+```bash
+cd bindings/python
+maturin build --release --out ../../dist
+```
+
+which produces a `cryptotensors-0.2.3-*.whl` that ResultsCloud deploys
+to its private PyPI alongside the license-provider wheel (Repo B).
+
+## ResultsCloud three-repo layout
+
+This fork is **Repo A** in a three-repo architecture:
+
+| Repo | Purpose |
+| ---- | ------- |
+| **Repo A** (this repo) | `cryptotensors` v0.2.3-ext fork — the only file format + crypto engine |
+| [**Repo B**](../cryptotensors-provider-resultscloud-license/) | `cryptotensors-provider-resultscloud-license` — Rust cdylib + Python wheel implementing the time-limited license KeyProvider |
+| [**Repo C**](../resultscloud-license-cli/) | `resultscloud-license-cli` — vendor-side Python CLI: generates keys, issues licenses, signs the cdylib |
+
+Nothing about Repo B or Repo C requires source edits to this fork; the
+extension mechanism above is the only coupling point.
+
+---
+
 # CryptoTensors
 
 This repository implements **CryptoTensors**, an LLM file format for secure model distribution. This implementation extends [safetensors](https://github.com/huggingface/safetensors) with encryption, signing, and access control capabilities while maintaining full backward compatibility with safetensors.
