@@ -49,6 +49,7 @@ import random
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Ensure we can import from utils directory
 # Try multiple possible paths (for local and Docker environments)
@@ -134,25 +135,39 @@ def _load_jwk_set(path: Path) -> tuple[dict, dict]:
     return enc, sign
 
 
-def _resolve_keys(args) -> tuple[dict, dict]:
-    """Pick the right loader and apply alg normalisation."""
-    if args.dek or args.vendor_priv:
-        if not (args.dek and args.vendor_priv):
+def _resolve_keys_from_paths(
+    dek: Optional[str],
+    vendor_priv: Optional[str],
+    key_file: Optional[str],
+) -> tuple[dict, dict]:
+    """Pick the right loader and apply alg normalisation.
+
+    Resolution order — *exactly* one of these three cases fires:
+
+      1. `dek` AND `vendor_priv` both given → license-cli workflow.
+      2. `key_file` given (and exists on disk) → legacy JWK-set path.
+      3. Neither → fall back to the built-in deterministic test keys.
+
+    Callers that want to reject the fallback (production pipelines)
+    should validate their args *before* calling this.
+    """
+    if dek or vendor_priv:
+        if not (dek and vendor_priv):
             raise ValueError("--dek and --vendor-priv must be provided together")
-        enc_key = _load_single_jwk(
-            Path(args.dek), required_kty="oct", label="--dek"
-        )
+        enc_key = _load_single_jwk(Path(dek), required_kty="oct", label="--dek")
         sign_key = _load_single_jwk(
-            Path(args.vendor_priv), required_kty="okp", label="--vendor-priv"
+            Path(vendor_priv), required_kty="okp", label="--vendor-priv"
         )
         print(
             "Using license-cli-produced keys: "
             f"dek kid={enc_key['kid']!r}, vendor sign kid={sign_key['kid']!r}"
         )
-    elif args.key_file and os.path.exists(args.key_file):
-        enc_key, sign_key = _load_jwk_set(Path(args.key_file))
-        print(f"Using JWK set from {args.key_file}: "
-              f"enc kid={enc_key.get('kid')!r}, sign kid={sign_key.get('kid')!r}")
+    elif key_file and os.path.exists(key_file):
+        enc_key, sign_key = _load_jwk_set(Path(key_file))
+        print(
+            f"Using JWK set from {key_file}: "
+            f"enc kid={enc_key.get('kid')!r}, sign kid={sign_key.get('kid')!r}"
+        )
     else:
         enc_key, sign_key = generate_test_keys()
         print("Using built-in deterministic TEST keys (NOT for production).")
@@ -169,21 +184,49 @@ def find_safetensors_files(model_dir: Path) -> list[Path]:
     return sorted(files)
 
 
-def convert_model(args) -> str:
-    """Convert a safetensors model to encrypted cryptotensors format."""
+def convert_model(
+    model_path: str,
+    output_path: str,
+    *,
+    dek: Optional[str] = None,
+    vendor_priv: Optional[str] = None,
+    key_file: Optional[str] = None,
+    encrypt_ratio: float = 0.1,
+    encrypt_all: bool = False,
+) -> str:
+    """Convert a safetensors model to encrypted cryptotensors format.
+
+    Programmatic API consumed by `convert_and_save.py` and
+    `run_full_test.py`. For CLI use, see `main()` below.
+
+    Args:
+        model_path: HuggingFace model ID or local directory.
+        output_path: Directory to write the encrypted model into.
+        dek / vendor_priv: license-cli workflow key files
+            (single-JWK each; see module docstring). Must be provided
+            together or not at all.
+        key_file: Legacy JWK-set file path. Mutually exclusive with
+            `dek` / `vendor_priv`.
+        encrypt_ratio: Fraction of tensors to encrypt when not
+            `encrypt_all`. Ignored when `encrypt_all=True`.
+        encrypt_all: Encrypt every tensor.
+
+    Returns:
+        Absolute path of the output directory on success.
+    """
     from cryptotensors.torch import load_file, save_file
     from huggingface_hub import snapshot_download
 
     # Download model if it's a HuggingFace ID
-    if not os.path.exists(args.model):
-        print(f"Downloading model from HuggingFace: {args.model}")
-        model_dir = Path(snapshot_download(args.model))
+    if not os.path.exists(model_path):
+        print(f"Downloading model from HuggingFace: {model_path}")
+        model_dir = Path(snapshot_download(model_path))
     else:
-        model_dir = Path(args.model)
+        model_dir = Path(model_path)
 
     print(f"Model directory: {model_dir}")
 
-    output_dir = Path(args.output)
+    output_dir = Path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy non-safetensors files (config, tokenizer, etc.)
@@ -199,7 +242,7 @@ def convert_model(args) -> str:
         raise FileNotFoundError(f"No safetensors files found in {model_dir}")
     print(f"Found {len(safetensors_files)} safetensors file(s)")
 
-    enc_key, sign_key = _resolve_keys(args)
+    enc_key, sign_key = _resolve_keys_from_paths(dek, vendor_priv, key_file)
 
     for sf_file in safetensors_files:
         print(f"\nProcessing: {sf_file.name}")
@@ -208,10 +251,10 @@ def convert_model(args) -> str:
         tensor_names = list(tensors.keys())
         print(f"  Total tensors: {len(tensor_names)}")
 
-        if args.encrypt_all:
+        if encrypt_all:
             tensors_to_encrypt = tensor_names
         else:
-            num_to_encrypt = max(1, int(len(tensor_names) * args.encrypt_ratio))
+            num_to_encrypt = max(1, int(len(tensor_names) * encrypt_ratio))
             tensors_to_encrypt = random.sample(tensor_names, num_to_encrypt)
 
         print(f"  Encrypting {len(tensors_to_encrypt)} tensors:")
@@ -295,7 +338,15 @@ def main():
         )
 
     try:
-        convert_model(args)
+        convert_model(
+            model_path=args.model,
+            output_path=args.output,
+            dek=args.dek,
+            vendor_priv=args.vendor_priv,
+            key_file=args.key_file,
+            encrypt_ratio=args.encrypt_ratio,
+            encrypt_all=args.encrypt_all,
+        )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

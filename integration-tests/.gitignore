@@ -1,7 +1,12 @@
-# Generated data files
+# Generated data files — keys, licenses, encrypted model artefacts.
+# Never commit these; they either contain secrets or bind to a host.
 data/
 *.safetensors
 *.jwk
+*.jwt
+vendor/
+secrets/
+rc-e2e-out/
 
 # Model cache
 models/

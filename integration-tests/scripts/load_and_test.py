@@ -4,8 +4,19 @@ Load encrypted model and test inference, comparing with original model.
 
 This script:
 1. Loads the original model and runs inference
-2. Loads the encrypted model and runs inference
+2. Loads the encrypted model and runs inference (via transformers pipeline)
 3. Compares outputs to verify encryption is transparent
+
+**Scope: upstream FileKeyProvider workflow only.** The transformers
+`pipeline` used here resolves the DEK through cryptotensors' built-in
+`FileKeyProvider`, which reads `CRYPTOTENSOR_KEY_JKU` and the `jku`
+metadata field written into the tensor header at encrypt time. That
+is **not** the ResultsCloud license workflow — for that,
+`LicenseProvider` produces the DEK from a signed `license.jwt` and the
+tensor header carries only a `kid`, no `jku`. Loading a ResultsCloud-
+encrypted model therefore requires the env-var setup in
+`cryptotensors-provider-resultscloud-license`'s README instead; see
+`resultscloud_e2e.py` for the corresponding smoke.
 
 Usage:
     python load_and_test.py --model Qwen/Qwen2-0.5B --encrypted /app/models/encrypted
