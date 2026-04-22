@@ -21,8 +21,12 @@ impl FromStr for SignatureAlgorithm {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Accept both the cryptotensors-native lower-case name
+        // (`ed25519`) and the JOSE standard header name (`EdDSA`).
+        // RFC 8037 uses `"alg": "EdDSA"` to refer to Ed25519 in JWK
+        // / JWS, which is what resultscloud-license-cli writes out.
         match s.to_uppercase().as_str() {
-            "ED25519" => Ok(SignatureAlgorithm::Ed25519),
+            "ED25519" | "EDDSA" => Ok(SignatureAlgorithm::Ed25519),
             _ => Err(()),
         }
     }

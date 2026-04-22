@@ -26,10 +26,15 @@ impl FromStr for EncryptionAlgorithm {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Normalise so we accept both cryptotensors-native names
+        // (`aes256gcm`, `aes-256-gcm`) and JOSE standard short names
+        // (`A128GCM`, `A256GCM`, etc.) — the latter is what RFC 7518
+        // prescribes and what resultscloud-license-cli / any other
+        // JOSE-compliant tool emits.
         let normalized = s.replace('-', "").to_lowercase();
         match normalized.as_str() {
-            "aes128gcm" => Ok(EncryptionAlgorithm::Aes128Gcm),
-            "aes256gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
+            "aes128gcm" | "a128gcm" => Ok(EncryptionAlgorithm::Aes128Gcm),
+            "aes256gcm" | "a256gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
             "chacha20poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
             _ => Err(()),
         }

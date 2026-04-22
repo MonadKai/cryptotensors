@@ -8,6 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project uses a fork-local version suffix (`-ext`, `-ext.2`, ...) on
 top of the upstream tag we branched from.
 
+## [v0.2.3-ext.3] — 2026-04-23
+
+### Added / changed
+
+- **JOSE alg names are now recognised by `EncryptionAlgorithm::from_str`
+  and `SignatureAlgorithm::from_str`.** RFC 7518 / RFC 8037 prescribe
+  `A128GCM` / `A256GCM` / `EdDSA` for JWK `alg` fields; upstream
+  cryptotensors only accepted its own lowercase native names
+  (`aes256gcm`, `ed25519`). Any JOSE-compliant tool (including
+  `resultscloud-license-cli`) therefore produced JWKs whose `alg` field
+  made cryptotensors fail to construct a `KeyMaterial`:
+
+      Error parsing CryptoTensors: InvalidAlgorithm("Invalid encryption algorithm")
+      Error parsing CryptoTensors: InvalidAlgorithm("Invalid signature algorithm")
+
+  The fork adds JOSE aliases to both parsers while keeping the native
+  names working unchanged — `"A256GCM"` and `"aes256gcm"` now both
+  resolve to `EncryptionAlgorithm::Aes256Gcm`, and `"EdDSA"` /
+  `"eddsa"` / `"ED25519"` all resolve to `SignatureAlgorithm::Ed25519`.
+
+### Tests
+
+Five new cases in `safetensors/tests/ext_provider_keys_test.rs`:
+- JOSE short names parse for A128GCM / A256GCM (and their lowercase forms)
+- Cryptotensors-native names still parse unchanged
+- Truly invalid / unsupported alg strings still error cleanly
+- JOSE EdDSA alias parses for both case variants
+- Cryptotensors-native `ed25519` still parses
+
 ## [v0.2.3-ext.2] — 2026-04-23
 
 ### Added / changed

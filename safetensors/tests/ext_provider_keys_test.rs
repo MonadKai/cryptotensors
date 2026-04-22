@@ -308,3 +308,85 @@ fn truly_invalid_base64_still_errors() {
     let msg = format!("{}", err);
     assert!(msg.contains("Invalid base64"), "got: {}", msg);
 }
+
+// ---------------------------------------------------------------------------
+// JOSE alg-name tolerance (v0.2.3-ext, third batch).
+//
+// RFC 7518 prescribes JOSE header alg names (A128GCM / A256GCM / EdDSA)
+// for JWKs. Upstream cryptotensors' parsers only recognised its own
+// lowercase names (aes256gcm / ed25519). JOSE-compliant tooling (our
+// resultscloud-license-cli among them) therefore produced JWKs that the
+// runtime rejected with "InvalidAlgorithm" at the first attempt to
+// build a KeyMaterial. The fork now accepts both forms.
+// ---------------------------------------------------------------------------
+
+use cryptotensors::encryption::EncryptionAlgorithm;
+use cryptotensors::signing::SignatureAlgorithm;
+
+#[test]
+fn enc_alg_accepts_jose_short_names() {
+    assert_eq!(
+        "A128GCM".parse::<EncryptionAlgorithm>().unwrap(),
+        EncryptionAlgorithm::Aes128Gcm
+    );
+    assert_eq!(
+        "A256GCM".parse::<EncryptionAlgorithm>().unwrap(),
+        EncryptionAlgorithm::Aes256Gcm
+    );
+    // Lower-case JOSE names also parse (we normalise case).
+    assert_eq!(
+        "a256gcm".parse::<EncryptionAlgorithm>().unwrap(),
+        EncryptionAlgorithm::Aes256Gcm
+    );
+}
+
+#[test]
+fn enc_alg_keeps_native_names_working() {
+    assert_eq!(
+        "aes256gcm".parse::<EncryptionAlgorithm>().unwrap(),
+        EncryptionAlgorithm::Aes256Gcm
+    );
+    assert_eq!(
+        "AES-256-GCM".parse::<EncryptionAlgorithm>().unwrap(),
+        EncryptionAlgorithm::Aes256Gcm
+    );
+    assert_eq!(
+        "chacha20poly1305".parse::<EncryptionAlgorithm>().unwrap(),
+        EncryptionAlgorithm::ChaCha20Poly1305
+    );
+}
+
+#[test]
+fn enc_alg_still_rejects_garbage() {
+    assert!("not-an-alg".parse::<EncryptionAlgorithm>().is_err());
+    assert!("".parse::<EncryptionAlgorithm>().is_err());
+    assert!("A192GCM".parse::<EncryptionAlgorithm>().is_err()); // unsupported size
+}
+
+#[test]
+fn sign_alg_accepts_jose_eddsa_alias() {
+    assert_eq!(
+        "EdDSA".parse::<SignatureAlgorithm>().unwrap(),
+        SignatureAlgorithm::Ed25519
+    );
+    assert_eq!(
+        "EDDSA".parse::<SignatureAlgorithm>().unwrap(),
+        SignatureAlgorithm::Ed25519
+    );
+    assert_eq!(
+        "eddsa".parse::<SignatureAlgorithm>().unwrap(),
+        SignatureAlgorithm::Ed25519
+    );
+}
+
+#[test]
+fn sign_alg_keeps_native_names_working() {
+    assert_eq!(
+        "ed25519".parse::<SignatureAlgorithm>().unwrap(),
+        SignatureAlgorithm::Ed25519
+    );
+    assert_eq!(
+        "ED25519".parse::<SignatureAlgorithm>().unwrap(),
+        SignatureAlgorithm::Ed25519
+    );
+}
