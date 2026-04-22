@@ -1,5 +1,11 @@
-//! Integration tests for the extensible provider public key whitelist
-//! (fork-only feature, v0.2.3-ext).
+//! Fork-local integration tests for cryptotensors v0.2.3-ext.
+//!
+//! Covers two independently-added features:
+//!   1. The runtime-extensible provider public key whitelist (this file's
+//!      original content).
+//!   2. JWK field decoding that accepts both padded-standard-base64 and
+//!      unpadded-base64url — see `jwk_b64_accepts_url_safe_unpadded` and
+//!      friends at the bottom.
 //!
 //! See `safetensors/src/registry.rs` — these tests drive `resolve_provider_pubkey`
 //! via the public API and cover the full matrix of extension configuration
@@ -222,4 +228,83 @@ fn extension_cannot_override_builtin() {
     // Built-in pubkey, NOT the EXT_PUBKEY_A we tried to inject.
     assert_eq!(resolved.as_deref(), Some(BUILTIN_PUBKEY));
     assert_ne!(resolved.as_deref(), Some(EXT_PUBKEY_A));
+}
+
+// ---------------------------------------------------------------------------
+// JWK base64 dialect tolerance (v0.2.3-ext, second batch).
+//
+// RFC 7517 says JWK `k`/`x`/`d` fields are unpadded base64url. Upstream
+// cryptotensors decodes them with padded STANDARD base64, which silently
+// rejects any standards-compliant JWK. The fork's `decode_jwk_b64`
+// helper accepts both dialects — test both ends of that through the
+// public `KeyMaterial` constructors.
+// ---------------------------------------------------------------------------
+
+use base64::engine::general_purpose::{STANDARD as _B64_STD, URL_SAFE_NO_PAD as _B64_URL};
+use base64::Engine as _;
+use cryptotensors::key::KeyMaterial;
+
+#[test]
+fn enc_key_accepts_padded_standard_base64() {
+    // 32 bytes of deterministic key material.
+    let raw: [u8; 32] = [0xAB; 32];
+    let k_std = _B64_STD.encode(raw);           // padded, `+/`
+    let km = KeyMaterial::new_enc_key(
+        Some(k_std),
+        Some("aes256gcm".into()),
+        Some("test-std".into()),
+        None,
+    )
+    .expect("KeyMaterial must parse padded standard base64");
+    assert_eq!(km.get_master_key_bytes().unwrap(), raw.to_vec());
+}
+
+#[test]
+fn enc_key_accepts_unpadded_base64url() {
+    let raw: [u8; 32] = [0xCD; 32];
+    // Simulate what resultscloud-license-cli (RFC 7517-compliant) emits:
+    // URL_SAFE alphabet, no `=` padding.
+    let k_url = _B64_URL.encode(raw);
+    assert!(!k_url.contains('='), "precondition: unpadded");
+    let km = KeyMaterial::new_enc_key(
+        Some(k_url),
+        Some("aes256gcm".into()),
+        Some("test-url".into()),
+        None,
+    )
+    .expect("KeyMaterial must parse unpadded base64url");
+    assert_eq!(km.get_master_key_bytes().unwrap(), raw.to_vec());
+}
+
+#[test]
+fn sign_key_accepts_unpadded_base64url_on_both_x_and_d() {
+    let priv_raw: [u8; 32] = [0x11; 32];
+    // Derive pub from priv so the kp is internally consistent.
+    let kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&priv_raw).unwrap();
+    let pub_raw = ring::signature::KeyPair::public_key(&kp).as_ref().to_vec();
+
+    let km = KeyMaterial::new_sign_key(
+        Some(_B64_URL.encode(&pub_raw)),
+        Some(_B64_URL.encode(priv_raw)),
+        Some("ed25519".into()),
+        Some("test-sign-url".into()),
+        None,
+    )
+    .expect("KeyMaterial must parse unpadded base64url for both x and d");
+    assert_eq!(km.get_public_key_bytes().unwrap(), pub_raw);
+    assert_eq!(km.get_private_key_bytes().unwrap(), priv_raw.to_vec());
+}
+
+#[test]
+fn truly_invalid_base64_still_errors() {
+    // Neither dialect can decode this; must NOT be silently accepted.
+    let err = KeyMaterial::new_enc_key(
+        Some("this!is?not^valid*base64".into()),
+        Some("aes256gcm".into()),
+        Some("bad".into()),
+        None,
+    )
+    .expect_err("garbage input must not parse");
+    let msg = format!("{}", err);
+    assert!(msg.contains("Invalid base64"), "got: {}", msg);
 }

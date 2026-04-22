@@ -8,6 +8,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project uses a fork-local version suffix (`-ext`, `-ext.2`, ...) on
 top of the upstream tag we branched from.
 
+## [v0.2.3-ext.2] — 2026-04-23
+
+### Added / changed
+
+- **JWK `k` / `x` / `d` fields now accept unpadded base64url in addition
+  to padded standard base64.** Upstream's `KeyMaterial` parsers
+  decoded these fields with `base64::engine::general_purpose::STANDARD`
+  only, which silently rejected any RFC 7517-compliant JWK (JOSE
+  standard prescribes unpadded base64url for key material fields).
+  The first time an operator fed a `dek.jwk` produced by
+  `resultscloud-license-cli` (or any other JOSE-compliant tool) into
+  the encryption pipeline, they got:
+
+      Failed to build Enc KeyMaterial: invalid key: Invalid base64 key: Invalid padding
+
+  The fork's new `decode_jwk_b64` helper in `safetensors/src/key.rs`
+  tries standard base64 first and falls back to base64url, so both
+  historical artefacts and modern JOSE-compliant JWKs load cleanly.
+  Applied at all five decode sites (enc `k`, sign `x`, sign `d`,
+  `get_master_key_bytes`, `get_public_key_bytes`, `get_private_key_bytes`).
+- **`integration-tests/scripts/convert_model.py` learned the
+  `--dek` / `--vendor-priv` input mode** for the
+  `resultscloud-license-cli` workflow, and now normalises JOSE alg
+  aliases (`A256GCM` → `aes256gcm`, `EdDSA` → `ed25519`) to the
+  cryptotensors-native names that the Rust parser accepts.
+
+### Tests
+
+Four new cases in `safetensors/tests/ext_provider_keys_test.rs`:
+padded-standard-base64 still parses, unpadded-base64url parses, both
+`x` and `d` tolerate the url-safe alphabet on the sign-key path, and
+genuinely invalid base64 still errors cleanly.
+
 ## [v0.2.3-ext] — 2026-04-22
 
 Forked from upstream `v0.2.3`. First fork release.
