@@ -1,0 +1,4 @@
+# Python packaging artifacts
+build/
+dist/
+py_src/*.egg-info/
