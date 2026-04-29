@@ -42,15 +42,72 @@ def init_key_provider(lib_path: str, **config) -> None:
     _load_provider_native(lib_path, json.dumps(config))
 
 
+def init_key_provider_by_name(name: str, **config) -> None:
+    """Python-only convenience: resolve ``name`` via the
+    ``cryptotensors.providers`` entry_points group and then load the
+    resolved cdylib by path.
+
+    Trust is *not* delegated to the ``name`` argument — the entry_points
+    group is a pure catalog/discovery channel. The actual trust decision
+    happens inside :func:`init_key_provider` (Rust-side signature
+    verification + identity binding against the signing keypair).
+
+    A provider that doesn't declare an entry_point in the
+    ``cryptotensors.providers`` group is invisible to this function but
+    can still be loaded directly with :func:`init_key_provider`.
+
+    Args:
+        name: The entry_point name declared by the provider package
+            (e.g. ``"resultscloud-license"``).
+        **config: Provider-specific config; forwarded to
+            :func:`init_key_provider`.
+
+    Raises:
+        ValueError: No installed provider matches ``name``, or the
+            matched module does not expose ``get_native_lib_path()``.
+    """
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group="cryptotensors.providers"):
+        if ep.name == name:
+            module = ep.load()
+            if not hasattr(module, "get_native_lib_path"):
+                raise ValueError(
+                    f"Provider {name!r} module exposes no get_native_lib_path()"
+                )
+            return init_key_provider(module.get_native_lib_path(), **config)
+    raise ValueError(
+        f"No installed provider named {name!r}. "
+        f"Install with: pip install cryptotensors-provider-{name}"
+    )
+
+
 def list_key_providers() -> list:
     """Names of providers currently registered and enabled in the Rust
     registry, in priority order (highest first).
 
     NOTE: This reflects what is *loaded right now*, not what is *installable*.
     A provider package installed in the environment but never loaded via
-    :func:`init_key_provider` will not appear here.
+    :func:`init_key_provider` will not appear here. Use
+    :func:`list_installed_providers` for the catalog view.
     """
     return _list_registered_providers()
+
+
+def list_installed_providers() -> list:
+    """Catalog of provider packages installed in this environment.
+
+    Reads the ``cryptotensors.providers`` entry_points group. This group
+    is a pure inventory channel — a declaration here does NOT grant
+    trust. Trust is decided at load time by Rust-side signature
+    verification.
+
+    Distinct from :func:`list_key_providers`, which returns providers
+    currently loaded into the registry.
+    """
+    from importlib.metadata import entry_points
+
+    return [ep.name for ep in entry_points(group="cryptotensors.providers")]
 
 
 def register_direct_key_provider(*, files=None, keys=None):
@@ -214,7 +271,9 @@ __all__ = [
     "register_direct_key_provider",
     "register_tmp_key_provider",  # Backward compatibility alias
     "init_key_provider",
+    "init_key_provider_by_name",
     "list_key_providers",
+    "list_installed_providers",
     "SerializeCryptoConfig",
     "DeserializeCryptoConfig",
 ]

@@ -148,6 +148,10 @@ import cryptotensors
 # - The cdylib is rejected unless its signature verifies against one of
 #   cryptotensors' compiled-in trusted public keys AND its self-reported
 #   name matches the trusted name bound to that key.
+# - The cdylib must export `cryptotensors_provider_abi_version` and that
+#   value must equal `cryptotensors::CRYPTOTENSORS_PROVIDER_ABI_VERSION`,
+#   so a provider built against a different cryptotensors version is
+#   rejected at load time instead of crashing on a vtable mismatch.
 cryptotensors.init_key_provider(
     "/path/to/libmy_provider.so",
     # provider-specific config kwargs are JSON-encoded and forwarded to
@@ -163,15 +167,44 @@ cryptotensors.list_key_providers()
 cryptotensors.disable_provider("my-provider")
 ```
 
-Provider packages don't need to declare `entry_points` — discovery is no
-longer Python's job. They typically ship a `.pth` autoload hook that
-calls `init_key_provider(get_native_lib_path())` at interpreter startup
-when an opt-in env var is set, but any caller can register a provider by
-just passing a path. See
+### Python convenience: name-based loading
+
+`init_key_provider` is the canonical, language-agnostic API. For Python
+deployments where the provider is `pip install`ed and you'd rather not
+hand-write a path, there's a convenience wrapper that resolves the
+`.so` path via the `cryptotensors.providers` entry_points group and
+then delegates to `init_key_provider`:
+
+```python
+import cryptotensors
+
+# Resolves "resultscloud-license" via entry_points → bundled .so path,
+# then runs the same path-based loader. Trust is still decided by the
+# signing keypair on the cdylib, never by this name argument.
+cryptotensors.init_key_provider_by_name("resultscloud-license", license_path="...")
+
+# Catalog of provider packages installed in this environment (entry_points
+# discovery, NOT the Rust registry). Distinct from list_key_providers().
+cryptotensors.list_installed_providers()
+# → ['resultscloud-license']
+```
+
+`list_installed_providers()` and `init_key_provider_by_name()` are
+**Python-only convenience layers**. The `cryptotensors.providers`
+entry_points group is a pure inventory channel — declarations there
+do **not** grant trust. Trust is decided exclusively by Rust-side
+signature verification at load time. Non-Python callers (a Go sidecar,
+a C embedding, a future CLI) just call `init_key_provider(path)` and
+manage their own discovery.
+
+Provider packages should still ship a `.pth` autoload hook that calls
+`init_key_provider(get_native_lib_path())` at interpreter startup when
+an opt-in env var is set, so most users never call any of the above
+manually. See
 [`cryptotensors-provider-resultscloud-license`](https://github.com/aiyah-meloken/cryptotensors-provider-resultscloud-license)
 for a reference implementation, and [`docs/DESIGN.md`](docs/DESIGN.md)
-for the full provider-loading architecture, signature flow, and threat
-model.
+for the full provider-loading architecture, signature flow, ABI
+handshake, and threat model.
 
 # Additional Information
 

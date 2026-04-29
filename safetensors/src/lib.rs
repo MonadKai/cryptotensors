@@ -42,8 +42,10 @@ pub use key::KeyMaterial;
 pub use policy::AccessPolicy;
 pub use registry::{
     disable_provider, enable_provider, get_master_key, get_signing_key, get_verify_key,
-    load_provider_native, register_provider, register_provider_with_priority, DirectKeyProvider,
-    KeyProvider, PRIORITY_DIRECT, PRIORITY_ENV, PRIORITY_FILE, PRIORITY_NATIVE, PRIORITY_TEMP,
+    list_registered_providers, load_provider_native, register_provider,
+    register_provider_with_priority, DirectKeyProvider, KeyProvider,
+    CRYPTOTENSORS_PROVIDER_ABI_VERSION, PRIORITY_DIRECT, PRIORITY_ENV, PRIORITY_FILE,
+    PRIORITY_NATIVE, PRIORITY_TEMP,
 };
 
 #[cfg(feature = "provider-env")]

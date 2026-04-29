@@ -47,6 +47,32 @@ const PROVIDER_PUBLIC_KEYS: &[(&str, &str)] = &[
 ];
 
 // ============================================================================
+// Provider ABI Version
+// ============================================================================
+
+/// ABI version of the native-provider cdylib contract (the C extern
+/// pair `cryptotensors_create_provider` / `cryptotensors_provider_abi_version`
+/// plus the `KeyProvider` trait vtable they cross). Bumped on every
+/// breaking change to either side.
+///
+/// At load time, [`load_provider_native`] dlsym's
+/// `cryptotensors_provider_abi_version` from the cdylib and refuses to
+/// proceed unless the returned value equals this constant. A provider
+/// crate built against a different cryptotensors version will
+/// (because it forwards the constant from its own dependency on
+/// cryptotensors) report a different number, and the load is
+/// rejected with a clear error rather than risking trait-object
+/// vtable layout undefined behaviour.
+///
+/// **Bump this constant on:** any change to `KeyProvider` trait
+/// methods or method signatures, any change to the
+/// `cryptotensors_create_provider` extern signature, any change to
+/// the `KeyMaterial` / `serde_json::Value` contracts those trait
+/// methods exchange. Don't bump it for purely internal refactors that
+/// preserve the public surface.
+pub const CRYPTOTENSORS_PROVIDER_ABI_VERSION: u32 = 1;
+
+// ============================================================================
 // Priority Constants
 // ============================================================================
 
@@ -852,6 +878,11 @@ pub fn clear_providers() {
 #[allow(improper_ctypes_definitions)]
 pub type CreateProviderFn = unsafe extern "C" fn() -> *mut dyn KeyProvider;
 
+/// Function signature for the ABI version handshake symbol that
+/// every provider cdylib must export. See
+/// [`CRYPTOTENSORS_PROVIDER_ABI_VERSION`] for semantics.
+pub type ProviderAbiVersionFn = unsafe extern "C" fn() -> u32;
+
 /// Verify the signature of a library file by trying every trusted public key
 /// in `PROVIDER_PUBLIC_KEYS`. Returns the provider name associated with the
 /// matching key on success — that name is the *trusted* identity of the
@@ -933,6 +964,31 @@ pub fn load_provider_native(
     };
 
     let lib = std::sync::Arc::new(lib);
+
+    // ABI version handshake — must run before we instantiate anything
+    // out of the cdylib. A provider built against a different
+    // cryptotensors version may have an incompatible KeyProvider
+    // vtable layout; calling create_fn there would be UB. The
+    // handshake is required, so a cdylib that doesn't even export
+    // the symbol (e.g. built against an old cryptotensors that
+    // predates ABI versioning) is rejected here too.
+    let abi_fn: libloading::Symbol<ProviderAbiVersionFn> = unsafe {
+        lib.get(b"cryptotensors_provider_abi_version").map_err(|e| {
+            CryptoTensorsError::Registry(format!(
+                "Provider library missing cryptotensors_provider_abi_version symbol \
+                 (rebuild against a cryptotensors version that supports ABI versioning): {}",
+                e
+            ))
+        })?
+    };
+    let provider_abi = unsafe { abi_fn() };
+    if provider_abi != CRYPTOTENSORS_PROVIDER_ABI_VERSION {
+        return Err(CryptoTensorsError::Registry(format!(
+            "Provider ABI version mismatch: cdylib reports {}, runtime expects {}. \
+             Rebuild the provider against this cryptotensors version.",
+            provider_abi, CRYPTOTENSORS_PROVIDER_ABI_VERSION
+        )));
+    }
 
     let create_fn: libloading::Symbol<CreateProviderFn> = unsafe {
         lib.get(b"cryptotensors_create_provider").map_err(|e| {

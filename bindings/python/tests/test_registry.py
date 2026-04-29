@@ -103,6 +103,27 @@ class TestRegistry(unittest.TestCase):
         names_final = cryptotensors.list_key_providers()
         self.assertNotIn("DirectKeyProvider", names_final)
 
+    def test_init_key_provider_by_name_unknown_raises(self):
+        # Convenience wrapper: a name with no matching entry_point must
+        # raise rather than fall through to a Rust-side error. This is
+        # purely a Python-layer contract — the Rust loader is never
+        # invoked because resolution fails first.
+        with self.assertRaises(ValueError) as cm:
+            cryptotensors.init_key_provider_by_name("definitely-not-installed")
+        self.assertIn("definitely-not-installed", str(cm.exception))
+
+    def test_list_installed_providers_is_catalog_view(self):
+        # list_installed_providers is a pure inventory channel that
+        # reads entry_points; it must NOT depend on whether a provider
+        # is currently loaded into the registry. Returning a list (even
+        # an empty one) on a venv with no provider packages installed
+        # is the correct behaviour.
+        result = cryptotensors.list_installed_providers()
+        self.assertIsInstance(result, list)
+        # All entries must be strings — the entry_point name.
+        for name in result:
+            self.assertIsInstance(name, str)
+
     def test_env_provider(self):
         # Set environment variable
         os.environ["CRYPTOTENSOR_KEYS"] = json.dumps(

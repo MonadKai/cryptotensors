@@ -91,7 +91,7 @@ const PROVIDER_PUBLIC_KEYS: &[(&str, &str)] = &[
 ];
 ```
 
-When `load_provider_native(lib_path, config_json)` runs, it does five
+When `load_provider_native(lib_path, config_json)` runs, it does six
 things in this order, and any failure aborts before any provider code
 executes:
 
@@ -109,22 +109,30 @@ executes:
 │                                                                     │
 │ 3. dlopen the cdylib (libloading::Library::new).                    │
 │                                                                     │
-│ 4. dlsym `cryptotensors_create_provider`, call it, take ownership   │
+│ 4. dlsym `cryptotensors_provider_abi_version`, call it, compare     │
+│    against CRYPTOTENSORS_PROVIDER_ABI_VERSION. Mismatch (or symbol  │
+│    missing on a pre-handshake cdylib) → reject with                 │
+│       "Provider ABI version mismatch".                              │
+│    This guard runs BEFORE we instantiate anything from the cdylib,  │
+│    because doing so on a vtable-incompatible build is undefined     │
+│    behaviour.                                                       │
+│                                                                     │
+│ 5. dlsym `cryptotensors_create_provider`, call it, take ownership   │
 │    of the returned Box<dyn KeyProvider>, run                        │
 │    provider.initialize(config_json).                                │
 │                                                                     │
-│ 5. Cross-check: if provider.name() != trusted_name, reject with     │
+│ 6. Cross-check: if provider.name() != trusted_name, reject with     │
 │       "Provider name mismatch: cdylib reports X, signing key is Y". │
 │    Otherwise register it at PRIORITY_NATIVE.                        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The two-step identity binding (step 2 + step 5) is the load-bearing
-property:
+The two-step identity binding (step 2 + step 6) is the load-bearing
+trust property:
 
 - **Step 2** says "this binary was signed by someone we trust." It
   doesn't yet say *who* among the trusted set.
-- **Step 5** says "the cdylib self-reports as the same identity that
+- **Step 6** says "the cdylib self-reports as the same identity that
   the signing key is registered under." A keypair holder cannot ship
   a cdylib that masquerades as some other provider — the name has to
   match the row in the table that pubkey lives in.
@@ -133,6 +141,18 @@ Trying every pubkey in the table (rather than indexing by a
 caller-supplied name) is what removes the name parameter from the
 loader. The table is hardcoded at compile time and has < 10 entries in
 practice, so the linear scan costs microseconds.
+
+Step 4 — the **ABI handshake** — is a separate kind of safety check.
+The cdylib and runtime both depend on `cryptotensors`, and
+`cryptotensors_create_provider` returns a `*mut dyn KeyProvider` whose
+vtable layout depends on whatever cryptotensors version each side was
+compiled against. If those versions disagree on the trait's method
+table, calling any method through the trait object is UB. The
+handshake symbol forwards `CRYPTOTENSORS_PROVIDER_ABI_VERSION` from
+the cdylib's compiled-in cryptotensors crate; the runtime compares it
+to its own constant; mismatched versions abort cleanly here. Bump the
+constant on every breaking change to the `KeyProvider` trait or the
+extern signatures.
 
 ### Tampering and rotation
 
@@ -197,9 +217,14 @@ pinning across both crates is a hard requirement of the loader contract.
 ### Public Python API
 
 ```python
+# Canonical, language-agnostic — Rust does all the trust work.
 def init_key_provider(lib_path: str, **config) -> None: ...
-def list_key_providers() -> list[str]: ...
+def list_key_providers() -> list[str]: ...           # what's loaded right now
 def disable_provider(name: str) -> None: ...
+
+# Python-only convenience layer over entry_points discovery.
+def init_key_provider_by_name(name: str, **config) -> None: ...
+def list_installed_providers() -> list[str]: ...     # what's installable
 
 # in-process direct registration (separate path, no cdylib):
 def register_direct_key_provider(*, files=None, keys=None) -> None: ...
@@ -207,12 +232,34 @@ def register_direct_key_provider(*, files=None, keys=None) -> None: ...
 
 `init_key_provider` returns `None` on success and raises on any of:
 sig file missing, sig verification failure, library open failure,
-missing `cryptotensors_create_provider` symbol, `initialize()` failure,
-or the step-5 name mismatch.
+missing `cryptotensors_provider_abi_version` symbol or version
+mismatch, missing `cryptotensors_create_provider` symbol,
+`initialize()` failure, or the step-6 name mismatch.
 
 `list_key_providers` returns the names of currently-registered, enabled
 providers in priority order (highest first). It reflects the Rust
 registry, not "what's installable in the venv."
+
+#### The convenience layer is not a trust channel
+
+`init_key_provider_by_name` and `list_installed_providers` both read
+the `cryptotensors.providers` entry_points group. **That group is a
+catalog, not a trust signal.** A provider package can declare an
+entry_point with any name; the runtime never trusts the name. Trust
+is decided exclusively in step 2 of the loader (signature verifies
+against a compile-time-blessed key) and step 6 (cdylib's self-reported
+name matches the trusted name). The convenience layer's only job is
+"Python user typed a string, find the corresponding `.so` path on
+disk, hand it to the real loader." If you delete the entry_points
+declaration from a provider package, that package becomes invisible
+to `list_installed_providers` / `init_key_provider_by_name` but
+remains perfectly loadable via `init_key_provider(<explicit path>)` —
+trust is unaffected.
+
+This explicit non-coupling is what lets non-Python callers bypass the
+convenience layer entirely. A Go sidecar, a CLI, a C embedding all
+talk to the Rust loader directly with a path string and never touch
+entry_points.
 
 ---
 
@@ -220,10 +267,20 @@ registry, not "what's installable in the venv."
 
 A package that wants to ship a cdylib for cryptotensors needs to:
 
-1. **Build a `cdylib` Rust crate** that exports
-   `extern "C" fn cryptotensors_create_provider() -> *mut dyn KeyProvider`,
-   linked against the same `cryptotensors` major version that runtime
-   users will deploy.
+1. **Build a `cdylib` Rust crate** that exports two symbols:
+   - `extern "C" fn cryptotensors_create_provider() -> *mut dyn KeyProvider`
+     — the factory the loader calls in step 5.
+   - `extern "C" fn cryptotensors_provider_abi_version() -> u32` —
+     should forward `cryptotensors::CRYPTOTENSORS_PROVIDER_ABI_VERSION`
+     from the cryptotensors crate it depends on. The runtime reads
+     this in step 4 of the load sequence and rejects the cdylib if it
+     doesn't match its own constant.
+
+   Linked against the same `cryptotensors` major version that runtime
+   users will deploy. The ABI handshake will catch most mismatches at
+   load time, but a deliberately-faked version number would still let
+   you build something that passes the handshake and then UBs on the
+   first trait-method call — don't do that.
 
 2. **Sign the resulting `.so` / `.dylib` / `.dll`** with the Ed25519
    private key whose public half is registered in
@@ -265,7 +322,9 @@ for the autoload pattern.
 | ------------------------------------------------------- | ---------------------------------------------------------------- |
 | Unsigned cdylib                                         | step 2 of load: no `.sig` → reject.                              |
 | Cdylib signed by an untrusted key                       | step 2: no row in `PROVIDER_PUBLIC_KEYS` matches.                |
-| Cdylib signed correctly but name forged                 | step 5: cdylib's `provider.name()` ≠ trusted name → reject.      |
+| Cdylib signed correctly but name forged                 | step 6: cdylib's `provider.name()` ≠ trusted name → reject.      |
+| Cdylib built against an incompatible cryptotensors ver  | step 4: `cryptotensors_provider_abi_version` mismatch → reject  |
+|                                                         | before any trait-object call.                                    |
 | Caller passes a *path* to a different blessed cdylib    | out of scope at the loader; the caller chose the path.           |
 | Tampered `<lib>.sig`                                    | Ed25519 verify fails on first byte change.                       |
 | Trusted private key leaked                              | rotate by editing `PROVIDER_PUBLIC_KEYS` and shipping a new      |
@@ -275,7 +334,7 @@ for the autoload pattern.
 | Cdylib calls back into cryptotensors with a forged path | the registry doesn't accept loads from inside provider code;     |
 |                                                         | initialize is the only entry the cdylib gets.                    |
 
-The loader is a **trust boundary**, not a sandbox. After step 5
+The loader is a **trust boundary**, not a sandbox. After step 6
 succeeds, the cdylib runs with full process privileges. Don't accept
 provider crates from anyone whose private key you haven't audited the
 provenance of.
@@ -284,14 +343,23 @@ provenance of.
 
 ## 7. Future work
 
-- A way to register a trusted pubkey at *install time* rather than
-  *compile time*, gated by a separate signed `trusted.json` whose
-  vetting key is itself compiled in. (The provider-resultscloud-license
-  repo's `CRYPTOTENSOR_TRUSTED_PROVIDERS_FILE` is an early sketch of
-  this — but the runtime currently reads pubkeys only from
-  `PROVIDER_PUBLIC_KEYS`.)
-- Versioning the cdylib ABI explicitly (a `cryptotensors_provider_abi_version`
-  symbol the loader could check) so that mismatched cryptotensors and
-  provider versions fail loudly instead of through trait-object UB.
-- Non-Python bindings (C, Go) for the loader — the API is already
-  shaped for them; what's missing is the FFI surface.
+- **Install-time signed trust file**: replace cryptotensors'
+  compile-time `PROVIDER_PUBLIC_KEYS` with a signed `trusted.json`
+  whose vetting-of-vetting key is itself compiled in. That would let
+  us enroll new providers without releasing a new cryptotensors
+  wheel. Sketch of the structure:
+  - cryptotensors compiles in a single **vetting pubkey** instead of a
+    table of provider pubkeys.
+  - At runtime, cryptotensors reads `trusted.json` from a known path
+    (env var or fixed location), verifies its signature against the
+    vetting pubkey, and uses its contents as the table of trusted
+    provider pubkeys (i.e. takes over the role of today's
+    `PROVIDER_PUBLIC_KEYS`).
+  - Adding a new provider to the ecosystem becomes "ship a signed
+    `trusted.json` row," not "release a new cryptotensors version."
+  - Vetting pubkey rotation still requires a cryptotensors release,
+    but it's a much rarer event than provider enrolment.
+- **Non-Python bindings** (C, Go) for the loader — the API is already
+  shaped for them; what's missing is the FFI surface and an example
+  callsite. The hardest part (language-agnostic discovery) is solved;
+  the remaining work is mechanical.
