@@ -33,11 +33,20 @@ use cryptotensors::key::KeyMaterial;
 use cryptotensors::policy::AccessPolicy;
 use cryptotensors::registry::{self, load_provider_native, DirectKeyProvider, PRIORITY_DIRECT};
 
-/// MODIFIED: Load a native provider from a shared library.
+/// MODIFIED: Load a native provider from a shared library by path. The
+/// provider's name comes from the cdylib (validated against the signing
+/// keypair), not from Python.
 #[pyfunction]
-fn py_load_provider_native(name: &str, lib_path: &str, config_json: &str) -> PyResult<()> {
-    load_provider_native(name, lib_path, config_json)
+fn py_load_provider_native(lib_path: &str, config_json: &str) -> PyResult<()> {
+    load_provider_native(lib_path, config_json)
         .map_err(|e| PyException::new_err(e.to_string()))
+}
+
+/// MODIFIED: Names of providers currently registered and enabled in the
+/// global Rust registry, in priority order.
+#[pyfunction]
+fn py_list_registered_providers() -> Vec<String> {
+    registry::list_registered_providers()
 }
 
 /// MODIFIED: Disable and remove a key provider by name.
@@ -2474,6 +2483,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rewrap_header, m)?)?;
     m.add_function(wrap_pyfunction!(rewrap, m)?)?;
     m.add_function(wrap_pyfunction!(py_load_provider_native, m)?)?;
+    m.add_function(wrap_pyfunction!(py_list_registered_providers, m)?)?;
     m.add_function(wrap_pyfunction!(disable_provider, m)?)?;
     m.add_function(wrap_pyfunction!(_register_key_provider_internal, m)?)?;
     m.add_class::<safe_open>()?;

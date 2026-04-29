@@ -852,22 +852,13 @@ pub fn clear_providers() {
 #[allow(improper_ctypes_definitions)]
 pub type CreateProviderFn = unsafe extern "C" fn() -> *mut dyn KeyProvider;
 
-/// Verify the signature of a library file using the hardcoded public key.
-/// Expects a signature file at <lib_path>.sig
-fn verify_library_signature(provider_name: &str, lib_path: &str) -> Result<(), CryptoTensorsError> {
+/// Verify the signature of a library file by trying every trusted public key
+/// in `PROVIDER_PUBLIC_KEYS`. Returns the provider name associated with the
+/// matching key on success — that name is the *trusted* identity of the
+/// cdylib, derived from the signing keypair (not from any caller-supplied
+/// argument). Expects a signature file at `<lib_path>.sig`.
+fn verify_library_signature(lib_path: &str) -> Result<&'static str, CryptoTensorsError> {
     let sig_path = format!("{}.sig", lib_path);
-
-    // Find the public key for this provider
-    let public_key_str = PROVIDER_PUBLIC_KEYS
-        .iter()
-        .find(|(name, _)| *name == provider_name)
-        .map(|(_, key)| *key)
-        .ok_or_else(|| {
-            CryptoTensorsError::Registry(format!(
-                "No trusted public key configured for provider: {}",
-                provider_name
-            ))
-        })?;
 
     // Read library file
     let mut lib_file = File::open(lib_path)
@@ -894,32 +885,47 @@ fn verify_library_signature(provider_name: &str, lib_path: &str) -> Result<(), C
         .read_to_string(&mut sig_base64)
         .map_err(|e| CryptoTensorsError::Registry(format!("Failed to read signature: {}", e)))?;
 
-    let signature = BASE64
+    let signature_bytes = BASE64
         .decode(sig_base64.trim())
         .map_err(|e| CryptoTensorsError::Registry(format!("Invalid signature encoding: {}", e)))?;
 
-    // Decode public key
-    let public_key_bytes = BASE64
-        .decode(public_key_str)
-        .map_err(|e| CryptoTensorsError::Registry(format!("Invalid public key encoding: {}", e)))?;
+    // Try each trusted public key in turn. The first one to verify wins, and
+    // its associated provider name becomes the trusted identity. Pubkey-name
+    // pairs are hardcoded at compile time, so the table is small (n < 10) and
+    // an exhaustive scan is cheap.
+    for (provider_name, public_key_str) in PROVIDER_PUBLIC_KEYS.iter() {
+        let public_key_bytes = match BASE64.decode(public_key_str) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let peer_public_key =
+            signature::UnparsedPublicKey::new(&signature::ED25519, public_key_bytes);
+        if peer_public_key.verify(&lib_data, &signature_bytes).is_ok() {
+            return Ok(provider_name);
+        }
+    }
 
-    // Verify signature
-    let peer_public_key = signature::UnparsedPublicKey::new(&signature::ED25519, public_key_bytes);
-    peer_public_key.verify(&lib_data, &signature).map_err(|e| {
-        CryptoTensorsError::Registry(format!("Signature verification failed: {}", e))
-    })?;
-
-    Ok(())
+    Err(CryptoTensorsError::Registry(format!(
+        "Signature verification failed: no trusted public key matched the signature for {}",
+        lib_path
+    )))
 }
 
-/// Dynamically load a native provider from a shared library
+/// Dynamically load a native provider from a shared library.
+///
+/// The provider's identity is derived purely from the cdylib itself — the
+/// signing keypair authenticates it (via [`verify_library_signature`]), and
+/// the cdylib's own [`KeyProvider::name`] must agree with that trusted
+/// identity. No caller-supplied name is accepted, so this function is
+/// language-agnostic: any binding that can pass a path string can load a
+/// provider.
 pub fn load_provider_native(
-    name: &str,
     lib_path: &str,
     config_json: &str,
 ) -> Result<(), CryptoTensorsError> {
-    // SECURITY: Verify the signature of the library before loading it
-    verify_library_signature(name, lib_path)?;
+    // SECURITY: Verify the signature of the library and bind its trusted name
+    // before any code from the cdylib runs.
+    let trusted_name = verify_library_signature(lib_path)?;
 
     let lib = unsafe {
         libloading::Library::new(lib_path)
@@ -937,6 +943,18 @@ pub fn load_provider_native(
     let mut provider = unsafe { Box::from_raw(create_fn()) };
     provider.initialize(config_json)?;
 
+    // Cross-check: the cdylib must self-identify as the trusted name. A
+    // keypair holder cannot ship a cdylib that masquerades as some other
+    // provider — even though the signature alone doesn't prevent that, this
+    // check does.
+    if provider.name() != trusted_name {
+        return Err(CryptoTensorsError::Registry(format!(
+            "Provider name mismatch: cdylib reports {:?}, but signing key is registered as {:?}",
+            provider.name(),
+            trusted_name
+        )));
+    }
+
     register_provider_full(provider, PRIORITY_NATIVE, Some(lib));
 
     Ok(())
@@ -949,6 +967,23 @@ pub fn provider_count() -> usize {
         guard.len()
     } else {
         0
+    }
+}
+
+/// Names of currently-registered, enabled providers, in priority order
+/// (highest first). This is the canonical "what's loaded right now" view of
+/// the registry — exposed to all bindings so language frontends don't need
+/// their own bookkeeping.
+pub fn list_registered_providers() -> Vec<String> {
+    let providers = get_providers();
+    if let Ok(guard) = providers.read() {
+        guard
+            .iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| entry.provider.name().to_string())
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -1102,6 +1137,49 @@ mod tests {
         // After disable, the provider should be removed
         assert_eq!(guard.len(), 1);
         assert_eq!(guard[0].provider.name(), "low");
+    }
+
+    #[test]
+    fn test_list_registered_providers_priority_order() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        clear_providers();
+
+        register_provider_with_priority(
+            Box::new(TestProvider {
+                name: "low".into(),
+                ready: true,
+            }),
+            0,
+        );
+        register_provider_with_priority(
+            Box::new(TestProvider {
+                name: "high".into(),
+                ready: true,
+            }),
+            10,
+        );
+
+        let names = list_registered_providers();
+        assert_eq!(names, vec!["high".to_string(), "low".to_string()]);
+
+        disable_provider("high");
+        let names_after = list_registered_providers();
+        assert_eq!(names_after, vec!["low".to_string()]);
+    }
+
+    #[test]
+    fn test_verify_library_signature_missing_sig_file() {
+        // Construct a path that exists (this source file) but has no .sig
+        // sibling — verification must fail cleanly with the "Signature
+        // file missing" message rather than panicking.
+        let result = verify_library_signature(file!());
+        let err = result.expect_err("expected signature verification to fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Signature file missing"),
+            "unexpected error: {}",
+            msg
+        );
     }
 
     #[test]

@@ -1,7 +1,6 @@
 # MODIFIED: Added encryption/decryption support for CryptoTensors
 # This is a derivative work based on the safetensors project by Hugging Face Inc.
 import json
-from importlib.metadata import entry_points
 from ._safetensors_rust import (  # noqa: F401
     SafetensorError,
     __version__,
@@ -15,39 +14,43 @@ from ._safetensors_rust import (  # noqa: F401
     rewrap,
     disable_provider,
     py_load_provider_native as _load_provider_native,
+    py_list_registered_providers as _list_registered_providers,
     _register_key_provider_internal,
 )
 
 
-def _find_provider_native_lib(name: str) -> str:
-    """Find provider native library path via entry_points"""
-    eps = entry_points(group="cryptotensors.providers")
-    for ep in eps:
-        if ep.name == name:
-            # Load the module and get the native lib path
-            module = ep.load()
-            if hasattr(module, "get_native_lib_path"):
-                return module.get_native_lib_path()
-            else:
-                # Fallback: assume the module itself is the path or has it
-                raise ValueError(
-                    f"Provider '{name}' module does not have get_native_lib_path()"
-                )
-    raise ValueError(
-        f"Provider '{name}' not found. Install with: pip install cryptotensors-provider-{name}"
-    )
+def init_key_provider(lib_path: str, **config) -> None:
+    """Load and register a native provider cdylib by filesystem path.
 
+    The provider's identity (name) comes from the cdylib itself, validated
+    against the trusted signing keypair built into cryptotensors. No name
+    parameter is accepted from the caller — that decouples discovery from
+    loading and lets any binding (Python, C, Go, …) register a provider just
+    by passing a path.
 
-def init_key_provider(name: str, **config):
-    """Initialize and activate a key provider"""
-    lib_path = _find_provider_native_lib(name)
-    _load_provider_native(name, lib_path, json.dumps(config))
+    Args:
+        lib_path: Absolute path to the provider .so/.dylib/.dll. The
+            companion ``<lib_path>.sig`` (Ed25519 signature, base64) must
+            live next to it.
+        **config: Provider-specific config keyword args; serialised to JSON
+            and passed to the cdylib's ``initialize``.
+
+    Raises:
+        Exception: signature missing or untrusted, library missing the
+            ``cryptotensors_create_provider`` symbol, or initialize() failure.
+    """
+    _load_provider_native(lib_path, json.dumps(config))
 
 
 def list_key_providers() -> list:
-    """List available key providers"""
-    eps = entry_points(group="cryptotensors.providers")
-    return [ep.name for ep in eps]
+    """Names of providers currently registered and enabled in the Rust
+    registry, in priority order (highest first).
+
+    NOTE: This reflects what is *loaded right now*, not what is *installable*.
+    A provider package installed in the environment but never loaded via
+    :func:`init_key_provider` will not appear here.
+    """
+    return _list_registered_providers()
 
 
 def register_direct_key_provider(*, files=None, keys=None):

@@ -131,6 +131,48 @@ with safe_open("model.safetensors", framework="pt", device="cpu") as f:
 ```
 
 
+## Native Key Providers (path-based loader)
+
+Beyond the built-in `EnvKeyProvider` and `FileKeyProvider`, third parties
+can ship signed Rust cdylibs that plug into the global key registry —
+e.g. licensing engines, KMS bridges, HSM clients. Loading is **path-based
+and language-agnostic**: any binding (Python, C, Go, future ones) just
+hands the Rust core a filesystem path and the cdylib's identity is
+derived from its signing keypair, not from anything the caller passes in.
+
+```python
+import cryptotensors
+
+# Load a signed provider cdylib by path.
+# - <lib_path>.sig must live next to the .so/.dylib/.dll.
+# - The cdylib is rejected unless its signature verifies against one of
+#   cryptotensors' compiled-in trusted public keys AND its self-reported
+#   name matches the trusted name bound to that key.
+cryptotensors.init_key_provider(
+    "/path/to/libmy_provider.so",
+    # provider-specific config kwargs are JSON-encoded and forwarded to
+    # the cdylib's initialize()
+    license_path="/etc/myprovider/license.jwt",
+)
+
+# What's loaded right now (canonical view; lives in the Rust registry)
+cryptotensors.list_key_providers()
+# → ['my-provider', 'env', 'file']
+
+# Remove a registered provider by name
+cryptotensors.disable_provider("my-provider")
+```
+
+Provider packages don't need to declare `entry_points` — discovery is no
+longer Python's job. They typically ship a `.pth` autoload hook that
+calls `init_key_provider(get_native_lib_path())` at interpreter startup
+when an opt-in env var is set, but any caller can register a provider by
+just passing a path. See
+[`cryptotensors-provider-resultscloud-license`](https://github.com/aiyah-meloken/cryptotensors-provider-resultscloud-license)
+for a reference implementation, and [`docs/DESIGN.md`](docs/DESIGN.md)
+for the full provider-loading architecture, signature flow, and threat
+model.
+
 # Additional Information
 
 ## File Format

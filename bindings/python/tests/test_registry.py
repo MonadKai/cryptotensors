@@ -82,6 +82,27 @@ class TestRegistry(unittest.TestCase):
             if os.path.exists(jwk_path):
                 os.remove(jwk_path)
 
+    def test_list_key_providers_reflects_registry(self):
+        # Baseline: a freshly registered direct provider must appear; after
+        # disabling it, it must disappear. This is the canonical test that
+        # the Python list now reflects the *Rust* registry rather than
+        # entry_points metadata.
+        cryptotensors.disable_provider("DirectKeyProvider")
+        names_before = cryptotensors.list_key_providers()
+        self.assertNotIn("DirectKeyProvider", names_before)
+
+        cryptotensors.register_tmp_key_provider(
+            keys=[self.keys["enc_key"], self.keys["sign_key"]]
+        )
+        try:
+            names_after = cryptotensors.list_key_providers()
+            self.assertIn("DirectKeyProvider", names_after)
+        finally:
+            cryptotensors.disable_provider("DirectKeyProvider")
+
+        names_final = cryptotensors.list_key_providers()
+        self.assertNotIn("DirectKeyProvider", names_final)
+
     def test_env_provider(self):
         # Set environment variable
         os.environ["CRYPTOTENSOR_KEYS"] = json.dumps(
